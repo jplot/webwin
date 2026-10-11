@@ -14,6 +14,8 @@ target_link_libraries(app PRIVATE webwin)
 
 Linking `webwin` adds its include directories and force-includes `compat/msvc_compat.h` in C++ sources. The page must serve the files listed in the target's `WEB_FILES` property next to the wasm: `web_fs.js` (game data folder access) and `coi-serviceworker.js` (cross-origin isolation on static hosting).
 
+Datagrams between pages (`webwin/web_net.h`) go through the page, which carries them as it likes (WebRTC, a relay): it sets `Module.webnet = { send(address, port, bytes) }` and passes the ones it receives to `Module.webnetDeliver(address, port, bytes)`.
+
 ## Origin
 
 Extracted from the web port of [KisakBlack](https://github.com/SwagSoftware/KisakBlack) by [riicchhaarrd](https://github.com/riicchhaarrd/KisakBlack/tree/web-port). Licensed under the GPL-3.0, like KisakBlack.

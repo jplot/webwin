@@ -7,6 +7,7 @@ add_library(webwin STATIC
     src/win_kernel.cpp
     src/web_fibers.cpp
     src/web_fs.cpp
+    src/web_net.cpp
     src/sdl_window.cpp
     src/msvc_rand.cpp
     src/msvc_crt.cpp
@@ -44,3 +45,11 @@ endif()
 # Files the page must serve next to the wasm; the consumer copies them.
 set_target_properties(webwin PROPERTIES WEB_FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/web/web_fs.js;${CMAKE_CURRENT_SOURCE_DIR}/web/coi-serviceworker.js")
+
+option(WEBWIN_WEB_TESTS "Build the Node tests" OFF)
+if (WEBWIN_WEB_TESTS AND EMSCRIPTEN AND WEBWIN_PTHREADS)
+    add_executable(net_threads tests/web/net_threads.cpp)
+    target_link_libraries(net_threads PRIVATE webwin)
+    target_link_options(net_threads PRIVATE -sPROXY_TO_PTHREAD -sEXIT_RUNTIME=1 -sPTHREAD_POOL_SIZE=8
+        "--pre-js=${CMAKE_CURRENT_SOURCE_DIR}/tests/web/net_threads.pre.js")
+endif()
