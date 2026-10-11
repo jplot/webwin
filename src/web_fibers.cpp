@@ -205,11 +205,13 @@ void WebFiber_Yield(void) {
     // get another turn, then schedule someone else. The main fiber is not queued; it
     // resumes whenever workers run dry.
     WebFiber *next = PopReady();
+    // A worker that only ever yields (KB_StreamPump polling with Sleep) starved the main
+    // fiber after boot: hand it back when no other worker is ready.
+    if (!next && self != &g_mainFiber && g_mainFiber.state == FS_READY) next = &g_mainFiber;
     if (!next) return;                 // nobody else to run — stay on self
-    if (self != &g_mainFiber) {        // re-queue self behind the others
-        self->state = FS_READY;
+    self->state = FS_READY;
+    if (self != &g_mainFiber)          // re-queue self behind the others
         g_ready.push_back(self);
-    }
     SwapTo(self, next);
 }
 
