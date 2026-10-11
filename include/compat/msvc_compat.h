@@ -1,0 +1,290 @@
+// msvc_compat.h — MSVC/Hex-Rays keyword compatibility for GCC/Clang builds.
+//
+// The decompiled sources use a handful of MSVC builtins that GCC/Clang don't
+// provide as keywords. This header supplies them on non-MSVC. It is force-included
+// (compiler `-include`) ahead of every translation unit on non-Windows so it
+// applies before q_shared.h (which already maps __int64/_DWORD/etc. for __GNUC__).
+//
+// Calling-convention keywords: GCC/Clang do NOT accept the bare __cdecl /
+// __stdcall / __fastcall / __thiscall on a non-Windows target (they parse as
+// identifiers -> "expected initializer"). The build is 32-bit x86 and internally
+// self-consistent (no external symbol relies on a specific convention), so map
+// them all to nothing (see below).
+#ifndef KISAK_MSVC_COMPAT_H
+#define KISAK_MSVC_COMPAT_H
+
+#include "msvc_intrin.h"  // _Interlocked*/MemoryBarrier -> GCC builtins
+
+#if !defined(_MSC_VER)
+
+// MSVC makes the C string/float-limits functions broadly visible; the decompiled
+// code uses memset/memcpy/FLT_MAX/etc. without always including the header. Pull
+// them in build-wide (this header is force-included) to match. (Not <cstdlib> —
+// its POSIX random()/etc. clash with the engine's own declarations.)
+#include <cstring>
+#include <cfloat>
+#include <cstdio>
+#include <ctime>
+#include <cctype>
+#include <csetjmp>
+// NOT <strings.h>: it declares index()/rindex(), which collide with the engine's
+// `index` variables. Declare the two case-insensitive compares we need directly.
+// On Emscripten/musl these are declared in <strings.h> WITHOUT noexcept, so a
+// noexcept redeclaration is an error there; drop the spec under __EMSCRIPTEN__.
+#if defined(__EMSCRIPTEN__)
+extern "C" int strcasecmp(const char *, const char *);
+extern "C" int strncasecmp(const char *, const char *, size_t);
+#else
+extern "C" int strcasecmp(const char *, const char *) noexcept;
+extern "C" int strncasecmp(const char *, const char *, size_t) noexcept;
+#endif
+
+#ifndef __debugbreak
+#define __debugbreak() __builtin_trap()
+#endif
+
+// More MSVC-isms: another calling convention, and the _-prefixed CRT aliases.
+#ifndef __pascal
+#define __pascal
+#endif
+#ifndef _snprintf
+#define _snprintf  snprintf
+#define _vsnprintf vsnprintf
+#define _stricmp   strcasecmp
+#define _strnicmp  strncasecmp
+#define _strdup    strdup
+#endif
+// Wide secure printf variants -> the C wide-char equivalents (CubeMapGen/ErrorMsg).
+#include <cwchar>
+#include <cstdarg>
+// declared directly (not <cstdlib>: random() clash). Emscripten/musl declares these
+// without an exception-spec, so the noexcept redeclaration is an error there.
+#if defined(__EMSCRIPTEN__)
+extern "C" { _Noreturn void exit(int); void *realloc(void *, size_t); }
+#else
+extern "C" { void exit(int) noexcept; void *realloc(void *, size_t) noexcept; }
+#endif
+static inline void *_aligned_realloc(void *p, size_t size, size_t /*align*/) { return realloc(p, size); }
+static inline int _vsnwprintf_s(wchar_t *buf, size_t bufsize, size_t /*count*/, const wchar_t *fmt, va_list args) {
+    return bufsize ? vswprintf(buf, bufsize, fmt, args) : 0;
+}
+static inline int _vscwprintf(const wchar_t *fmt, va_list args) { wchar_t tmp[2048]; return vswprintf(tmp, 2048, fmt, args); }
+static inline int _snwprintf_s(wchar_t *buf, size_t bufsize, size_t /*count*/, const wchar_t *fmt, ...) {
+    if (!bufsize) return 0; va_list a; va_start(a, fmt); int r = vswprintf(buf, bufsize, fmt, a); va_end(a); return r;
+}
+#include <cerrno>
+static inline int sprintf_s(char *buf, size_t size, const char *fmt, ...) {
+    va_list a; va_start(a, fmt); int r = vsnprintf(buf, size, fmt, a); va_end(a); return r;
+}
+template <size_t N> static inline int sprintf_s(char (&buf)[N], const char *fmt, ...) {
+    va_list a; va_start(a, fmt); int r = vsnprintf(buf, N, fmt, a); va_end(a); return r;
+}
+#ifndef _TRUNCATE
+#define _TRUNCATE ((size_t)-1)
+#endif
+// With _TRUNCATE, MSVC cuts the output to fit and returns -1 when it had to.
+static inline int _snprintf_s(char *buf, size_t size, size_t /*count*/, const char *fmt, ...) {
+    if (!size) return -1;
+    va_list a; va_start(a, fmt); int r = vsnprintf(buf, size, fmt, a); va_end(a);
+    return r < 0 || (size_t)r >= size ? -1 : r;
+}
+static inline int strcpy_s(char *dst, size_t size, const char *src) {
+    if (!dst || !size) return EINVAL;
+    size_t n = strlen(src);
+    if (n >= size) { dst[0] = 0; return ERANGE; }
+    memcpy(dst, src, n + 1);
+    return 0;
+}
+static inline int fopen_s(FILE **file, const char *name, const char *mode) {
+    *file = fopen(name, mode);
+    return *file ? 0 : errno;
+}
+template <size_t N> static inline int _snprintf_s(char (&buf)[N], size_t count, const char *fmt, ...) {
+    va_list a; va_start(a, fmt); int r = vsnprintf(buf, N, fmt, a); va_end(a);
+    return r < 0 || (size_t)r >= N ? -1 : r;
+}
+template <size_t N> static inline int strcpy_s(char (&dst)[N], const char *src) { return strcpy_s(dst, N, src); }
+template <size_t N> static inline int strncpy_s(char (&dst)[N], const char *src, size_t count) {
+    size_t n = strlen(src);
+    if (count != _TRUNCATE && count < n) n = count;
+    if (n >= N) n = N - 1;
+    memcpy(dst, src, n);
+    dst[n] = 0;
+    return 0;
+}
+#define _countof(a) (sizeof(a) / sizeof((a)[0]))
+#define sscanf_s sscanf
+#define strtok_s strtok_r
+static inline int localtime_s(struct tm *out, const time_t *t) { return localtime_r(t, out) ? 0 : EINVAL; }
+static inline int strncpy_s(char *dst, size_t size, const char *src, size_t count) {
+    if (!dst || !size) return EINVAL;
+    size_t n = strlen(src);
+    if (count != _TRUNCATE && count < n) n = count;
+    if (n >= size) n = size - 1;
+    memcpy(dst, src, n);
+    dst[n] = 0;
+    return 0;
+}
+extern "C" void *_aligned_malloc(size_t size, size_t align); // platform/linux/sys_platform.cpp
+extern "C" void _aligned_free(void *p);
+
+// MSVC's _-prefixed sized-int CRT conversions -> POSIX/C equivalents. Declared
+// directly (NOT via <cstdlib>) so we don't pull in POSIX random()/srandom(), which
+// collide with the engine's own random() declaration (only scope-renamed in a few
+// files). These libc symbols are otherwise standard.
+#if defined(__EMSCRIPTEN__)  // musl declares these without an exception-spec
+extern "C" long long          atoll(const char *);
+extern "C" long long          strtoll(const char *, char **, int);
+extern "C" unsigned long long strtoull(const char *, char **, int);
+extern "C" int                putenv(char *);
+#else
+extern "C" long long          atoll(const char *) noexcept;
+extern "C" long long          strtoll(const char *, char **, int) noexcept;
+extern "C" unsigned long long strtoull(const char *, char **, int) noexcept;
+extern "C" int                putenv(char *) noexcept;
+#endif
+static inline long long          _atoi64(const char *s)                    { return atoll(s); }
+static inline long long          _strtoi64(const char *s, char **e, int b)  { return strtoll(s, e, b); }
+static inline unsigned long long _strtoui64(const char *s, char **e, int b) { return strtoull(s, e, b); }
+static inline char *_strlwr(char *s) { for (char *p = s; *p; ++p) *p = (char)tolower((unsigned char)*p); return s; }
+static inline char *_strupr(char *s) { for (char *p = s; *p; ++p) *p = (char)toupper((unsigned char)*p); return s; }
+#ifndef _putenv
+#define _putenv putenv
+#endif
+#ifndef ARRAYSIZE
+#define ARRAYSIZE(a) (sizeof(a) / sizeof((a)[0]))
+#endif
+typedef FILE _iobuf;  // MSVC's FILE struct tag, used bare in the decompiled code
+
+// MSVC's 64-bit time CRT (rb_logfile.cpp) and the SEH-era setjmp spelling
+// (rb_backend.cpp). __time64_t is just a 64-bit time_t; map onto the POSIX CRT.
+typedef long long __time64_t;
+static inline __time64_t _time64(__time64_t *t) { time_t r = time(nullptr); if (t) *t = (__time64_t)r; return (__time64_t)r; }
+static inline struct tm *_localtime64(const __time64_t *t) { time_t v = (time_t)*t; return localtime(&v); }
+static inline struct tm *_gmtime64(const __time64_t *t)    { time_t v = (time_t)*t; return gmtime(&v); }
+static inline char       *_ctime64(const __time64_t *t)    { time_t v = (time_t)*t; return ctime(&v); }
+#include <cerrno>
+#ifndef _errno
+#define _errno() (&errno)   // MSVC: errno is (*_errno())
+#endif
+// _ui64toa(value, buffer, radix) — unsigned 64-bit integer-to-string.
+static inline char *_ui64toa(unsigned long long value, char *str, int radix) {
+    char tmp[65]; int i = 0;
+    do { unsigned d = (unsigned)(value % (unsigned)radix); tmp[i++] = (char)(d < 10 ? '0' + d : 'a' + d - 10); value /= (unsigned)radix; } while (value);
+    char *p = str; while (i > 0) *p++ = tmp[--i]; *p = '\0'; return str;
+}
+// MSVC spells setjmp `_setjmp`, and the decompiled code passes a raw int*/void*
+// buffer (not a typed jmp_buf). Bridge straight to glibc's __sigsetjmp primitive
+// (savemask 0): this both casts the buffer and avoids the glibc setjmp<->_setjmp
+// macro recursion that `#define _setjmp setjmp` would trigger.
+#ifdef __EMSCRIPTEN__
+// musl exposes _setjmp/setjmp/longjmp over `struct __jmp_buf_tag` (no glibc
+// __sigsetjmp/_longjmp). The engine's backing buffer (g_script_error) is enlarged
+// to a full jmp_buf under __EMSCRIPTEN__ (see cscr_evaluate.h), so the cast below
+// is valid. setjmp is itself a macro here, so undef before redefining to avoid
+// recursion. NOTE: Emscripten lowers setjmp/longjmp specially; this is the
+// supported, single-threaded path.
+#include <csetjmp>
+extern "C" int _setjmp(struct __jmp_buf_tag *) __attribute__((__returns_twice__));
+#ifndef _setjmp_compat_done
+#define _setjmp_compat_done
+#undef setjmp
+#undef _setjmp
+#undef longjmp
+#define _setjmp(buf)      _setjmp((struct __jmp_buf_tag *)(buf))
+#define setjmp(buf)       setjmp((struct __jmp_buf_tag *)(buf))
+#define longjmp(buf, val) longjmp((struct __jmp_buf_tag *)(buf), (val))
+#endif
+#else
+#ifndef _setjmp
+#define _setjmp(buf) __sigsetjmp((struct __jmp_buf_tag *)(buf), 0)
+#endif
+// longjmp's matching restore — the decompiled code passes the same raw int*/void*
+// buffer. _longjmp is glibc's non-sigmask variant (pairs with __sigsetjmp(...,0))
+// and isn't a macro, so this doesn't recurse.
+#define longjmp(buf, val) _longjmp((struct __jmp_buf_tag *)(buf), (val))
+#endif
+
+// Structured Exception Handling -> C++ try/catch. GCC has no SEH; the filter
+// expression is dropped (catch-all). This compiles the crash-guard scaffolding;
+// actual hardware-fault interception is a separate (deferred) concern.
+#ifndef __try
+#define __try            try
+#define __except(filter) catch (...)
+#define __finally
+#endif
+
+// Our 32-bit build uses the x87 FPU (no -mfpmath=sse), which is what the few
+// precision-sensitive files assert via MSVC's _M_IX86_FP (0 == x87, no SSE).
+#ifndef _M_IX86_FP
+#define _M_IX86_FP 0
+#endif
+
+// MSVC's qsort/bsearch comparator typedef (used in casts, e.g. rb_imagetouch.cpp).
+typedef int (*_CoreCrtNonSecureSearchSortCompareFunction)(const void *, const void *);
+
+#ifndef __forceinline
+#define __forceinline inline __attribute__((always_inline))
+#endif
+
+// Calling conventions -> nothing (see header note above).
+#ifndef __cdecl
+#define __cdecl
+#endif
+#ifndef __stdcall
+#define __stdcall
+#endif
+#ifndef __fastcall
+#define __fastcall
+#endif
+#ifndef __thiscall
+#define __thiscall
+#endif
+
+// MSVC's <windows.h> provides 2-arg min/max as macros; the decompiled engine calls
+// them bare. We can't use macros (they poison the C++ standard library — e.g.
+// numeric_limits::max), so provide global function templates instead. Safe because
+// the engine never does `using namespace std` (verified), so bare min/max resolve
+// here with no ambiguity. Two type params + a decltype'd return mirror the macro's
+// type-agnostic behaviour (mixed int/float operands).
+#if defined(__cplusplus)
+template <class A, class B> inline auto min(A a, B b) -> decltype(a < b ? a : b) { return a < b ? a : b; }
+template <class A, class B> inline auto max(A a, B b) -> decltype(a > b ? a : b) { return a > b ? a : b; }
+#endif
+
+// Sized integer keywords (also defined identically in q_shared.h under __GNUC__;
+// benign redefinition). Lets standalone headers like ui/keycodes.h — which use
+// `enum X : __int32` — compile without pulling in q_shared.h.
+#ifndef __int8
+#define __int8  char
+#endif
+#ifndef __int16
+#define __int16 short
+#endif
+#ifndef __int32
+#define __int32 int
+#endif
+#ifndef __int64
+#define __int64 long long
+#endif
+
+// MSVC __declspec(...) -> GCC/Clang. GCC does not parse `__declspec(align(N))`
+// natively (the decompiled code uses it on hundreds of structs). Map it via token
+// paste: __declspec(align(8)) -> __KISAK_DS_align(8) -> __attribute__((aligned(8))).
+// Coexists with -fms-extensions (verified).
+#define __declspec(x)          __KISAK_DS_##x
+#define _declspec(x)           __KISAK_DS_##x   // deprecated single-underscore spelling (r_stream.h)
+#define __KISAK_DS_align(n)    __attribute__((aligned(n)))
+#define __KISAK_DS_noinline    __attribute__((noinline))
+#define __KISAK_DS_noreturn    __attribute__((noreturn))
+#define __KISAK_DS_nothrow     __attribute__((nothrow))
+#define __KISAK_DS_deprecated  __attribute__((deprecated))
+#define __KISAK_DS_selectany   __attribute__((weak))
+#define __KISAK_DS_naked
+#define __KISAK_DS_dllimport
+#define __KISAK_DS_dllexport
+#define __KISAK_DS_import
+#define __KISAK_DS_export
+
+#endif // !_MSC_VER
+#endif // KISAK_MSVC_COMPAT_H

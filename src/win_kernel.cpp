@@ -1,0 +1,678 @@
+// win_kernel.cpp — POSIX/pthread implementations of the Win32 "kernel object" APIs
+// the engine uses (declared in platform/winsdk/windows.h): files, threads, events,
+// semaphores, mutexes, and virtual/global memory. All kernel handles are unified
+// behind one tagged object so CloseHandle / WaitForSingleObject dispatch on kind.
+//
+// This is the Linux replacement for the Win32 kernel calls in src/win32. Nothing
+// links against it yet (the engine is still being brought to compile), but the
+// implementations are real so the eventual link behaves correctly.
+#include <windows.h>
+
+#include <pthread.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/mman.h>   // mmap/munmap/madvise — page-aligned virtual memory
+#include <glob.h>
+#include <dirent.h>
+#include <strings.h>   // strcasecmp (safe here — this TU includes no engine 'index' globals)
+#include <cstdlib>
+#include <cstring>
+#include <cstdint>
+#include <ctime>
+#include <map>
+#include <mutex>
+#ifdef __EMSCRIPTEN__
+#include <webwin/web_fs.h>      // File System Access bridge (read-only game data)
+// KB_WEB_FIBERS: the single-OS-thread cooperative web build (Emscripten WITHOUT
+// -pthread). When -pthread is passed Emscripten defines __EMSCRIPTEN_PTHREADS__ and
+// every engine "thread" is a real Web Worker (pthread), so the cooperative fiber
+// scheduler is compiled out and the real pthread code paths below are taken instead
+// (the Win32-event emulation already runs on real pthread condvars/mutexes).
+#  if !defined(__EMSCRIPTEN_PTHREADS__)
+#    define KB_WEB_FIBERS 1
+#    include <webwin/web_fibers.h>  // cooperative green-thread scheduler (single OS thread)
+#  else
+#    include <emscripten/threading.h>  // emscripten_pthread_attr_settransferredcanvases
+#  endif
+#endif
+
+// ---- Case-insensitive path resolution --------------------------------------
+// The game ships Windows-cased asset paths (e.g. zone/english) on a case-sensitive
+// filesystem (the dir is zone/English). Resolve each component case-insensitively;
+// components that don't exist yet (new files being created) pass through unchanged.
+namespace {
+void ResolveCaseInsensitive(const char *inRaw, char *out, size_t outsz) {
+    if (!inRaw) { if (outsz) out[0] = 0; return; }
+    // Normalize Windows backslashes to '/' first (paths like base\zone\english\x.ff).
+    char in[4096]; { size_t i = 0; for (; inRaw[i] && i < sizeof(in) - 1; ++i) in[i] = inRaw[i] == '\\' ? '/' : inRaw[i]; in[i] = 0; }
+    struct stat st;
+    if (stat(in, &st) == 0) { strncpy(out, in, outsz - 1); out[outsz - 1] = 0; return; }
+    char resolved[4096]; size_t rlen = 0; resolved[0] = 0;
+    const char *p = in;
+    if (*p == '/') { resolved[rlen++] = '/'; resolved[rlen] = 0; ++p; }
+    bool give_up = false;
+    while (*p) {
+        const char *slash = strchr(p, '/');
+        size_t clen = slash ? (size_t)(slash - p) : strlen(p);
+        char comp[256]; if (clen >= sizeof(comp)) clen = sizeof(comp) - 1;
+        memcpy(comp, p, clen); comp[clen] = 0;
+        const char *sep = (rlen && resolved[rlen - 1] != '/') ? "/" : "";
+        char trial[4096]; snprintf(trial, sizeof(trial), "%s%s%s", resolved, sep, comp);
+        if (give_up || stat(trial, &st) == 0) {
+            strncpy(resolved, trial, sizeof(resolved) - 1);
+        } else {
+            DIR *d = opendir(rlen ? resolved : "."); bool found = false;
+            if (d) { struct dirent *e;
+                while ((e = readdir(d))) if (strcasecmp(e->d_name, comp) == 0) {
+                    snprintf(trial, sizeof(trial), "%s%s%s", resolved, sep, e->d_name);
+                    strncpy(resolved, trial, sizeof(resolved) - 1); found = true; break; }
+                closedir(d); }
+            if (!found) { strncpy(resolved, trial, sizeof(resolved) - 1); give_up = true; }  // new file: keep as-is
+        }
+        resolved[sizeof(resolved) - 1] = 0; rlen = strlen(resolved);
+        p += clen; if (*p == '/') ++p;
+    }
+    strncpy(out, resolved, outsz - 1); out[outsz - 1] = 0;
+}
+} // namespace
+
+namespace {
+
+enum Kind { K_FILE, K_THREAD, K_EVENT, K_SEM, K_MUTEX };
+
+struct KObject {
+    Kind kind;
+    int  fd = -1;                       // K_FILE
+#ifdef __EMSCRIPTEN__
+    int  webId = 0;                     // K_FILE: File System Access bridge id (0 = use fd)
+    long long webPos = 0;               // K_FILE: current offset for sequential ReadFile
+#endif
+    pthread_t thread{};                 // K_THREAD
+    LPTHREAD_START_ROUTINE start = nullptr;
+    void *param = nullptr;
+    pthread_mutex_t mtx{};              // K_EVENT / K_SEM / K_MUTEX / K_THREAD start-gate
+    pthread_cond_t  cond{};             // K_EVENT / K_SEM / K_THREAD start-gate
+    bool manualReset = false;          // K_EVENT
+    bool signaled = false;             // K_EVENT
+    long count = 0;                    // K_SEM
+    bool suspended = false;            // K_THREAD: CREATE_SUSPENDED start-gate
+#ifdef KB_WEB_FIBERS
+    // Cooperative-fiber backing (single OS thread): events/mutexes/threads are run
+    // through the fiber scheduler, NOT pthreads. The KObject pointer itself is the
+    // scheduler's wait token, so blocked fibers are matched to the object they wait on.
+    WebFiber *fiber = nullptr;         // K_THREAD: the fiber created for this "thread"
+    bool      locked = false;          // K_MUTEX: cooperatively held (single OS thread)
+#endif
+};
+
+inline KObject *obj(HANDLE h) { return reinterpret_cast<KObject *>(h); }
+inline bool valid(HANDLE h)   { return h && h != INVALID_HANDLE_VALUE; }
+
+// Absolute deadline `ms` from now, for pthread_cond_timedwait.
+void deadline(struct timespec *ts, DWORD ms) {
+    clock_gettime(CLOCK_REALTIME, ts);
+    ts->tv_sec  += ms / 1000;
+    ts->tv_nsec += (long)(ms % 1000) * 1000000L;
+    if (ts->tv_nsec >= 1000000000L) { ts->tv_sec++; ts->tv_nsec -= 1000000000L; }
+}
+
+void *thread_thunk(void *arg) {
+    KObject *k = static_cast<KObject *>(arg);
+    // CREATE_SUSPENDED start-gate: block until ResumeThread() opens it. This is
+    // load-bearing — Sys_CreateThread() creates every engine thread suspended,
+    // records its id in the thread table, then resumes it. Running early would
+    // race the id store (e.g. SV_ServerThread asserting Sys_IsServerThread()).
+    if (k->suspended) {
+        pthread_mutex_lock(&k->mtx);
+        while (k->suspended) pthread_cond_wait(&k->cond, &k->mtx);
+        pthread_mutex_unlock(&k->mtx);
+    }
+    if (k->start) k->start(k->param);
+    return nullptr;
+}
+
+#ifdef KB_WEB_FIBERS
+// Generic Win32 CreateThread() calls (jobqueue workers via _jqStart, mjpeg, etc.)
+// also become cooperative fibers. They have no fixed engine thread context, so we
+// hand out synthetic contexts starting past the engine's 15 (THREAD_CONTEXT_COUNT)
+// — the engine's Sys_Is*Thread() checks only the fixed contexts, so these never
+// collide. WebFiber_Create passes the synthetic ctx to the entry; we map ctx ->
+// KObject so the entry can find its LPTHREAD_START_ROUTINE + param.
+static int                  g_webGenericCtx = 64;     // next synthetic ctx
+static std::map<int, KObject *> g_webCtxToThread;     // ctx -> K_THREAD KObject
+
+void web_thread_fiber_entry(unsigned int ctx) {
+    auto it = g_webCtxToThread.find((int)ctx);
+    if (it == g_webCtxToThread.end()) return;
+    KObject *k = it->second;
+    if (k->start) k->start(k->param);
+    // The routine returned: mark the K_THREAD signaled so a join (WaitForSingleObject)
+    // unblocks, and wake any fiber waiting on this object.
+    k->signaled = true;
+    WebFiber_Wake(k);
+}
+#endif
+
+} // namespace
+
+#if defined(__EMSCRIPTEN_PTHREADS__)
+// The page OffscreenCanvas is handed to the proxied-main worker at startup (by
+// OFFSCREENCANVAS_SUPPORT / OFFSCREENCANVASES_TO_PTHREAD='#canvas'). It must be
+// re-transferred to the BACKEND (render) worker so that worker's WebGL2 context is
+// created locally — otherwise every GL call proxies synchronously to the DOM thread
+// (~1 FPS in-game). Sys_CreateThread() sets this flag immediately before the backend
+// thread's CreateThread() call; the next pthread_create() then transfers "#canvas" to
+// the new worker. A canvas can be owned by exactly one thread, so only the render
+// thread is flagged. See src/gfx_gl/glcontext_sdl.cpp.
+static bool g_kbTransferCanvasToNextThread = false;
+extern "C" void KB_Web_TransferCanvasToNextThread() { g_kbTransferCanvasToNextThread = true; }
+#endif
+
+// ---- Threads ---------------------------------------------------------------
+// CREATE_SUSPENDED is honored via a start-gate (see thread_thunk): the thread is
+// created but parks before the user routine until ResumeThread() runs. The engine
+// relies on this — it stores the new thread's id, then resumes — so the thread
+// never observes its id table slot before it is written.
+HANDLE CreateThread(void *, SIZE_T, LPTHREAD_START_ROUTINE start, void *param, DWORD flags, DWORD *threadId) {
+    KObject *k = new KObject(); k->kind = K_THREAD; k->start = start; k->param = param;
+    k->suspended = (flags & CREATE_SUSPENDED) != 0;
+#ifdef KB_WEB_FIBERS
+    // Cooperative single-OS-thread build: back this Win32 thread with a fiber. Assign
+    // a synthetic context past the engine's fixed contexts and register it so the
+    // fiber entry can find this KObject's start/param. If NOT suspended, queue it
+    // runnable immediately (it still won't run until the caller next yields/blocks).
+    int ctx = g_webGenericCtx++;
+    g_webCtxToThread[ctx] = k;
+    k->signaled = false;                 // becomes true when the routine returns (join)
+    k->fiber = WebFiber_Create(&web_thread_fiber_entry, (unsigned int)ctx);
+    if (!k->suspended) WebFiber_Resume(k->fiber);
+    if (threadId) *threadId = 0x57EB0000u | (unsigned int)(ctx & 0xFFFF);
+    return static_cast<HANDLE>(k);
+#else
+    pthread_mutex_init(&k->mtx, nullptr); pthread_cond_init(&k->cond, nullptr);
+    pthread_attr_t  attr;
+    pthread_attr_t *pattr = nullptr;
+#if defined(__EMSCRIPTEN_PTHREADS__)
+    // Render/backend worker only: transfer the page OffscreenCanvas to it so its WebGL2
+    // context renders locally instead of proxying every GL call to the DOM thread.
+    if (g_kbTransferCanvasToNextThread) {
+        g_kbTransferCanvasToNextThread = false;
+        pthread_attr_init(&attr);
+        // Transfer the HIDDEN #kbgl canvas, not the visible #canvas: extensions and
+        // screen recorders captureStream() the visible game canvas at page load, and a
+        // canvas with a capture stream can never be transferred offscreen
+        // ("NotSupportedError: Cannot transfer OffscreenCanvas bound to element using
+        // captureStream"). Nothing else touches #kbgl; frames reach the user via the
+        // #display overlay present (glcontext_sdl.cpp). The selector form works because
+        // the spawn is proxied to the DOM thread, where document.querySelector resolves
+        // it; emscripten registers the transfer under the raw id 'kbgl'.
+        int r = emscripten_pthread_attr_settransferredcanvases(&attr, "#kbgl");
+        fprintf(stderr, "[kb] backend thread: transfer '#kbgl' -> settransferredcanvases=%d "
+                        "(isPthread=%d)\n", r, emscripten_is_main_runtime_thread() ? 0 : 1);
+        pattr = &attr;
+    }
+#endif
+    if (pthread_create(&k->thread, pattr, thread_thunk, k) != 0) {
+        pthread_cond_destroy(&k->cond); pthread_mutex_destroy(&k->mtx);
+#if defined(__EMSCRIPTEN_PTHREADS__)
+        if (pattr) pthread_attr_destroy(pattr);
+#endif
+        delete k; return nullptr;
+    }
+#if defined(__EMSCRIPTEN_PTHREADS__)
+    if (pattr) pthread_attr_destroy(pattr);
+#endif
+    // The engine stores this id in its thread table and later matches it against
+    // GetCurrentThreadId() inside the new thread. GetCurrentThreadId() is
+    // (DWORD)(uintptr_t)pthread_self(), and pthread_self() in the new thread equals
+    // k->thread — so report that here, NOT 0.
+    if (threadId) *threadId = (DWORD)(uintptr_t)k->thread;
+    return static_cast<HANDLE>(k);
+#endif
+}
+DWORD ResumeThread(HANDLE h) {
+    if (!valid(h)) return 0;
+    KObject *k = obj(h);
+#ifdef KB_WEB_FIBERS
+    bool was = k->suspended; k->suspended = false;
+    if (k->fiber) WebFiber_Resume(k->fiber);
+    return was ? 1 : 0;
+#else
+    pthread_mutex_lock(&k->mtx);
+    bool was = k->suspended; k->suspended = false; pthread_cond_broadcast(&k->cond);
+    pthread_mutex_unlock(&k->mtx);
+    return was ? 1 : 0;   // prior suspend count
+#endif
+}
+DWORD SuspendThread(HANDLE) { return 0; }
+
+// ---- Events ----------------------------------------------------------------
+HANDLE CreateEventA(void *, BOOL manualReset, BOOL initialState, const char *) {
+    KObject *k = new KObject(); k->kind = K_EVENT;
+    k->manualReset = manualReset; k->signaled = initialState;
+    pthread_mutex_init(&k->mtx, nullptr); pthread_cond_init(&k->cond, nullptr);
+    return static_cast<HANDLE>(k);
+}
+BOOL SetEvent(HANDLE h) {
+    if (!valid(h)) return FALSE; KObject *k = obj(h);
+#ifdef KB_WEB_FIBERS
+    // Cooperative: set signaled and wake every fiber blocked on this event. The woken
+    // fibers run when the current fiber next yields/blocks. (No OS-thread wakeups.)
+    k->signaled = true;
+    WebFiber_Wake(k);
+    return TRUE;
+#else
+    pthread_mutex_lock(&k->mtx); k->signaled = true;
+    if (k->manualReset) pthread_cond_broadcast(&k->cond); else pthread_cond_signal(&k->cond);
+    pthread_mutex_unlock(&k->mtx); return TRUE;
+#endif
+}
+BOOL ResetEvent(HANDLE h) {
+    if (!valid(h)) return FALSE; KObject *k = obj(h);
+#ifdef KB_WEB_FIBERS
+    k->signaled = false; return TRUE;
+#else
+    pthread_mutex_lock(&k->mtx); k->signaled = false; pthread_mutex_unlock(&k->mtx); return TRUE;
+#endif
+}
+BOOL PulseEvent(HANDLE h) {
+    if (!valid(h)) return FALSE; KObject *k = obj(h);
+#ifdef KB_WEB_FIBERS
+    // Wake current waiters, then immediately clear (matches Win32 PulseEvent).
+    k->signaled = true; WebFiber_Wake(k); k->signaled = false; return TRUE;
+#else
+    pthread_mutex_lock(&k->mtx); k->signaled = true; pthread_cond_broadcast(&k->cond);
+    k->signaled = false; pthread_mutex_unlock(&k->mtx); return TRUE;
+#endif
+}
+
+// ---- Semaphores ------------------------------------------------------------
+HANDLE CreateSemaphoreA(void *, LONG initialCount, LONG, const char *) {
+    KObject *k = new KObject(); k->kind = K_SEM; k->count = initialCount;
+    pthread_mutex_init(&k->mtx, nullptr); pthread_cond_init(&k->cond, nullptr);
+    return static_cast<HANDLE>(k);
+}
+BOOL ReleaseSemaphore(HANDLE h, LONG releaseCount, LONG *prevCount) {
+    if (!valid(h)) return FALSE; KObject *k = obj(h);
+#ifdef KB_WEB_FIBERS
+    if (prevCount) *prevCount = (LONG)k->count;
+    k->count += releaseCount; WebFiber_Wake(k);
+    return TRUE;
+#else
+    pthread_mutex_lock(&k->mtx);
+    if (prevCount) *prevCount = (LONG)k->count;
+    k->count += releaseCount; pthread_cond_signal(&k->cond);
+    pthread_mutex_unlock(&k->mtx); return TRUE;
+#endif
+}
+
+// ---- Mutexes (recursive, matching Win32 semantics) -------------------------
+HANDLE CreateMutexA(void *, BOOL initialOwner, const char *) {
+    KObject *k = new KObject(); k->kind = K_MUTEX;
+#ifdef KB_WEB_FIBERS
+    // Cooperative mutex: just a flag. With one OS thread there is no real contention,
+    // but a fiber CAN hold the lock across a yield, so another fiber must wait (the
+    // wait yields until ReleaseMutex wakes it). Recursive ownership isn't tracked
+    // (the engine uses CRITICAL_SECTIONs for its recursive locks); a re-lock by the
+    // same fiber while held would deadlock — none of the boot-path mutexes do that.
+    k->locked = initialOwner ? true : false;
+    return static_cast<HANDLE>(k);
+#else
+    pthread_mutexattr_t a; pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&k->mtx, &a); pthread_mutexattr_destroy(&a);
+    if (initialOwner) pthread_mutex_lock(&k->mtx);
+    return static_cast<HANDLE>(k);
+#endif
+}
+BOOL ReleaseMutex(HANDLE h) {
+    if (!valid(h)) return FALSE;
+#ifdef KB_WEB_FIBERS
+    obj(h)->locked = false; WebFiber_Wake(obj(h)); return TRUE;
+#else
+    pthread_mutex_unlock(&obj(h)->mtx); return TRUE;
+#endif
+}
+
+// ---- Wait / close / duplicate ----------------------------------------------
+#ifdef KB_WEB_FIBERS
+// Cooperative wait: never blocks the OS thread. For an unsignaled INFINITE wait we
+// block this fiber and yield to the scheduler, which runs the worker fiber that will
+// signal us. For a finite/zero wait we allow a "deadlock return" (WAIT_TIMEOUT) so a
+// 1ms spin-wait loop (e.g. Sys_SyncDatabase) keeps the app responsive instead of
+// hanging when nothing else can run.
+static DWORD WaitForSingleObjectWeb(KObject *k, DWORD ms) {
+    const bool finite = (ms != INFINITE);     // ms==0 or ms>0 => allow timeout return
+    switch (k->kind) {
+    case K_THREAD:
+        // Join: wait until the fiber's routine returns (k->signaled set by the
+        // fiber entry trampoline). For a finite wait, poll-yield once.
+        for (;;) {
+            if (k->signaled) return WAIT_OBJECT_0;
+            if (!WebFiber_WaitOn(k, finite)) return WAIT_TIMEOUT;
+        }
+    case K_MUTEX:
+        // Cooperative lock: take it if free; otherwise yield until ReleaseMutex.
+        for (;;) {
+            if (!k->locked) { k->locked = true; return WAIT_OBJECT_0; }
+            if (!WebFiber_WaitOn(k, finite)) return WAIT_TIMEOUT;
+        }
+    case K_EVENT:
+        for (;;) {
+            if (k->signaled) {
+                if (!k->manualReset) k->signaled = false;   // auto-reset consumes
+                return WAIT_OBJECT_0;
+            }
+            if (ms == 0) return WAIT_TIMEOUT;               // poll with no block
+            if (!WebFiber_WaitOn(k, finite)) return WAIT_TIMEOUT;
+        }
+    case K_SEM:
+        for (;;) {
+            if (k->count > 0) { k->count--; return WAIT_OBJECT_0; }
+            if (ms == 0) return WAIT_TIMEOUT;
+            if (!WebFiber_WaitOn(k, finite)) return WAIT_TIMEOUT;
+        }
+    default: return WAIT_OBJECT_0;
+    }
+}
+#endif
+
+DWORD WaitForSingleObject(HANDLE h, DWORD ms) {
+    if (!valid(h)) return WAIT_TIMEOUT;
+    KObject *k = obj(h);
+#ifdef KB_WEB_FIBERS
+    return WaitForSingleObjectWeb(k, ms);
+#else
+    switch (k->kind) {
+    case K_MUTEX: pthread_mutex_lock(&k->mtx); return WAIT_OBJECT_0;
+    case K_THREAD: pthread_join(k->thread, nullptr); return WAIT_OBJECT_0;
+    case K_EVENT: {
+        pthread_mutex_lock(&k->mtx); int rc = 0;
+        struct timespec ts; if (ms != INFINITE) deadline(&ts, ms);
+        while (!k->signaled && rc == 0)
+            rc = (ms == INFINITE) ? pthread_cond_wait(&k->cond, &k->mtx)
+                                  : pthread_cond_timedwait(&k->cond, &k->mtx, &ts);
+        DWORD r = WAIT_OBJECT_0;
+        if (!k->signaled) r = WAIT_TIMEOUT; else if (!k->manualReset) k->signaled = false;
+        pthread_mutex_unlock(&k->mtx); return r;
+    }
+    case K_SEM: {
+        pthread_mutex_lock(&k->mtx); int rc = 0;
+        struct timespec ts; if (ms != INFINITE) deadline(&ts, ms);
+        while (k->count <= 0 && rc == 0)
+            rc = (ms == INFINITE) ? pthread_cond_wait(&k->cond, &k->mtx)
+                                  : pthread_cond_timedwait(&k->cond, &k->mtx, &ts);
+        DWORD r = WAIT_OBJECT_0;
+        if (k->count <= 0) r = WAIT_TIMEOUT; else k->count--;
+        pthread_mutex_unlock(&k->mtx); return r;
+    }
+    default: return WAIT_OBJECT_0;
+    }
+#endif
+}
+BOOL CloseHandle(HANDLE h) {
+    if (!valid(h)) return FALSE; KObject *k = obj(h);
+    switch (k->kind) {
+    case K_FILE:
+#ifdef __EMSCRIPTEN__
+                   if (k->webId) kbweb_close(k->webId);
+#endif
+                   if (k->fd >= 0) close(k->fd); break;
+#ifdef KB_WEB_FIBERS
+    // Cooperative fibers/events/mutexes carry no pthread primitives to destroy. The
+    // WebFiber itself is intentionally NOT freed here: an engine "thread" runs for the
+    // life of the process, and the engine closes/duplicates these handles freely; the
+    // fiber's stacks are reclaimed only at exit. (Boot-path handles are long-lived.)
+    case K_THREAD:
+    case K_EVENT:
+    case K_SEM:
+    case K_MUTEX:  break;
+#else
+    case K_THREAD: pthread_detach(k->thread);
+                   pthread_cond_destroy(&k->cond); pthread_mutex_destroy(&k->mtx); break;
+    case K_EVENT:
+    case K_SEM:    pthread_cond_destroy(&k->cond);  pthread_mutex_destroy(&k->mtx); break;
+    case K_MUTEX:  pthread_mutex_destroy(&k->mtx); break;
+#endif
+    }
+#ifdef KB_WEB_FIBERS
+    // Do NOT free a K_THREAD KObject: its fiber (still referenced via g_webCtxToThread
+    // and possibly mid-run) would be left dangling. These are long-lived engine
+    // threads; the small leak is intentional and bounded.
+    if (k->kind == K_THREAD) return TRUE;
+#endif
+    delete k; return TRUE;
+}
+// Win32 duplicates create a second reference; the engine only uses the duplicate as
+// an opaque handle, so alias the same object (close is the caller's responsibility).
+BOOL DuplicateHandle(HANDLE, HANDLE src, HANDLE, HANDLE *dst, DWORD, BOOL, DWORD) {
+    if (dst) *dst = src; return TRUE;
+}
+
+// ---- Files (HANDLE = K_FILE wrapping a POSIX fd) ---------------------------
+HANDLE CreateFileA(const char *name, DWORD access, DWORD, void *, DWORD disp, DWORD, HANDLE) {
+    int flags = 0;
+    if ((access & GENERIC_READ) && (access & GENERIC_WRITE)) flags = O_RDWR;
+    else if (access & GENERIC_WRITE)                         flags = O_WRONLY;
+    else                                                     flags = O_RDONLY;
+    switch (disp) {
+    case CREATE_ALWAYS: flags |= O_CREAT | O_TRUNC; break;
+    case OPEN_ALWAYS:   flags |= O_CREAT;           break;
+    case OPEN_EXISTING: default:                    break;
+    }
+#ifdef __EMSCRIPTEN__
+    // Read-only opens go to the File System Access bridge (the granted Steam
+    // folder). Writes/creates still use Emscripten's writable in-memory FS (MEMFS)
+    // for config/cache. The bridge resolves the path case-insensitively in JS.
+    if (flags == O_RDONLY && kbweb_ready()) {
+        int id = kbweb_open(name);
+        if (id > 0) {
+            KObject *k = new KObject(); k->kind = K_FILE; k->fd = -1;
+            k->webId = id; k->webPos = 0;
+            return static_cast<HANDLE>(k);
+        }
+        // fall through to MEMFS (e.g. a file we wrote earlier this session)
+    }
+#endif
+    char resolved[4096]; ResolveCaseInsensitive(name, resolved, sizeof(resolved));
+    int fd = open(resolved, flags, 0644);
+    if (fd < 0) return INVALID_HANDLE_VALUE;
+    KObject *k = new KObject(); k->kind = K_FILE; k->fd = fd;
+    return static_cast<HANDLE>(k);
+}
+BOOL ReadFile(HANDLE h, void *buf, DWORD n, DWORD *numRead, OVERLAPPED *) {
+    if (!valid(h)) return FALSE;
+#ifdef __EMSCRIPTEN__
+    if (obj(h)->webId) {
+        int r = kbweb_pread(obj(h)->webId, (double)obj(h)->webPos, buf, (int)n);
+        if (r < 0) { if (numRead) *numRead = 0; return FALSE; }
+        obj(h)->webPos += r;
+        if (numRead) *numRead = (DWORD)r;
+        return TRUE;
+    }
+#endif
+    ssize_t r = read(obj(h)->fd, buf, n);
+    if (numRead) *numRead = (r < 0) ? 0 : (DWORD)r; return r >= 0;
+}
+// Overlapped read: honour the OVERLAPPED offset (pread doesn't move the file
+// position). The engine's DB loader does these "async" then waits via an alertable
+// SleepEx — which our SleepEx returns from immediately, so the data is ready by then.
+BOOL ReadFileEx(HANDLE h, void *buf, DWORD n, OVERLAPPED *ov, LPOVERLAPPED_COMPLETION_ROUTINE) {
+    if (!valid(h)) return FALSE;
+    off_t off = ov ? (off_t)(((unsigned long long)ov->OffsetHigh << 32) | ov->Offset) : 0;
+#ifdef __EMSCRIPTEN__
+    if (obj(h)->webId) {
+        int r = kbweb_pread(obj(h)->webId, (double)off, buf, (int)n);
+        return r >= 0;
+    }
+#endif
+    ssize_t r = ov ? pread(obj(h)->fd, buf, n, off) : read(obj(h)->fd, buf, n);
+    return r >= 0;
+}
+BOOL WriteFile(HANDLE h, const void *buf, DWORD n, DWORD *written, OVERLAPPED *) {
+    if (!valid(h)) return FALSE; ssize_t w = write(obj(h)->fd, buf, n);
+    if (written) *written = (w < 0) ? 0 : (DWORD)w; return w >= 0;
+}
+DWORD GetFileSize(HANDLE h, DWORD *high) {
+    if (!valid(h)) return (DWORD)-1;
+#ifdef __EMSCRIPTEN__
+    if (obj(h)->webId) {
+        double sz = kbweb_size(obj(h)->webId);
+        if (sz < 0) return (DWORD)-1;
+        unsigned long long s = (unsigned long long)sz;
+        if (high) *high = (DWORD)(s >> 32);
+        return (DWORD)(s & 0xffffffffu);
+    }
+#endif
+    struct stat st;
+    if (fstat(obj(h)->fd, &st) != 0) return (DWORD)-1;
+    if (high) *high = (DWORD)((unsigned long long)st.st_size >> 32);
+    return (DWORD)(st.st_size & 0xffffffffu);
+}
+DWORD SetFilePointer(HANDLE h, LONG dist, LONG *distHigh, DWORD method) {
+    if (!valid(h)) return (DWORD)-1;
+    off_t off = (distHigh ? ((off_t)*distHigh << 32) : 0) | (unsigned)dist;
+#ifdef __EMSCRIPTEN__
+    if (obj(h)->webId) {
+        long long base = (method == FILE_CURRENT) ? obj(h)->webPos
+                       : (method == FILE_END)     ? (long long)kbweb_size(obj(h)->webId)
+                       :                            0;
+        long long np = base + off;
+        if (np < 0) return (DWORD)-1;
+        obj(h)->webPos = np;
+        if (distHigh) *distHigh = (LONG)((unsigned long long)np >> 32);
+        return (DWORD)((unsigned long long)np & 0xffffffffu);
+    }
+#endif
+    int whence = method == FILE_CURRENT ? SEEK_CUR : method == FILE_END ? SEEK_END : SEEK_SET;
+    off_t r = lseek(obj(h)->fd, off, whence);
+    if (r < 0) return (DWORD)-1;
+    if (distHigh) *distHigh = (LONG)((unsigned long long)r >> 32);
+    return (DWORD)(r & 0xffffffffu);
+}
+DWORD GetFileAttributesA(const char *name) {
+#ifdef __EMSCRIPTEN__
+    if (kbweb_ready()) {
+        int e = kbweb_exists(name);
+        if (e == 2) return FILE_ATTRIBUTE_DIRECTORY;
+        if (e == 1) return FILE_ATTRIBUTE_NORMAL;
+        // not in the granted folder — fall through to MEMFS (session-written files)
+    }
+#endif
+    char resolved[4096]; ResolveCaseInsensitive(name, resolved, sizeof(resolved));
+    struct stat st; if (stat(resolved, &st) != 0) return INVALID_FILE_ATTRIBUTES;
+    return S_ISDIR(st.st_mode) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+}
+DWORD GetCurrentDirectoryA(DWORD len, char *buf) {
+    if (!buf || !getcwd(buf, len)) return 0; return (DWORD)strlen(buf);
+}
+DWORD GetModuleFileNameA(HMODULE, char *buf, DWORD size) {
+    if (!buf || size == 0) return 0;
+    ssize_t n = readlink("/proc/self/exe", buf, size - 1);
+    if (n < 0) { buf[0] = '\0'; return 0; }
+    buf[n] = '\0'; return (DWORD)n;
+}
+
+// ---- Virtual / global memory (mmap-backed) ---------------------------------
+// The engine's Z_Virtual* layer reserves an address range then commits sub-ranges,
+// and Z_VirtualFree walks the committed regions via VirtualQuery before releasing.
+// Win32 VirtualAlloc always returns PAGE-ALIGNED memory; the engine's hunk relies on
+// that (it page-aligns sub-ranges with `& 0xFFFFF000` and asserts allocations are
+// 32-byte aligned). calloc only guarantees 16-byte alignment (a malloc-chunk header
+// sits between the page start and the returned pointer), which broke the hunk's
+// alignment assert during map load. So we back the reservation with mmap(MAP_ANONYMOUS):
+// page-aligned, demand-zero, lazily committed — matching Win32 reserve/commit semantics.
+// We track each (base -> size) so MEM_RELEASE can munmap and VirtualQuery can report
+// the owning allocation (its free-walk asserts AllocationBase==ptr, RegionSize>0).
+namespace { std::map<char *, size_t> g_vallocs; std::mutex g_vmutex; }
+void *VirtualAlloc(void *addr, SIZE_T size, DWORD, DWORD) {
+    if (addr) return addr;                          // commit within an already-reserved range (lazy)
+    size_t n = size ? size : 1;
+    void *p = mmap(nullptr, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return nullptr;
+    { std::lock_guard<std::mutex> lk(g_vmutex); g_vallocs[(char *)p] = n; }
+    return p;
+}
+BOOL VirtualFree(void *addr, SIZE_T size, DWORD freeType) {
+    if (!addr) return TRUE;
+    if (freeType & MEM_RELEASE) {
+        // Release the whole reservation; addr is its tracked base.
+        size_t n = 0;
+        { std::lock_guard<std::mutex> lk(g_vmutex);
+          auto it = g_vallocs.find((char *)addr);
+          if (it != g_vallocs.end()) { n = it->second; g_vallocs.erase(it); } }
+        if (n) munmap(addr, n);
+    } else {
+        // MEM_DECOMMIT: addr/size are a page-aligned SUB-REGION of a reservation.
+        // madvise(MADV_DONTNEED) drops the physical pages and faults in fresh zero
+        // pages on next access — exactly Win32's decommit / next-commit contract.
+        // (Hunk_Clear -> Z_VirtualDecommit passes page-aligned ranges.)
+        if (size) {
+#if defined(__EMSCRIPTEN__)
+            // Emscripten has no madvise(MADV_DONTNEED) (unsupported syscall -> no-op), so a
+            // decommit would leave STALE bytes and break the Win32 "next commit reads zero"
+            // contract the engine relies on. Freed temp-hunk script text then bleeds into
+            // reused DB/material allocations, and pointer fields read as ASCII (e.g. a
+            // vertexDecl that decodes to "emsc" from an .../emscripten/... path). Zero the
+            // range eagerly to match madvise's lazy zero-fill semantics.
+            memset(addr, 0, size);
+#else
+            if (((uintptr_t)addr & 0xFFF) == 0 && (size & 0xFFF) == 0)
+                madvise(addr, size, MADV_DONTNEED);
+            else
+                memset(addr, 0, size);
+#endif
+        }
+    }
+    return TRUE;
+}
+SIZE_T VirtualQuery(const void *addr, MEMORY_BASIC_INFORMATION *info, SIZE_T len) {
+    if (!info) return 0;
+    memset(info, 0, sizeof(*info));
+    char *a = (char *)addr;
+    std::lock_guard<std::mutex> lk(g_vmutex);
+    auto it = g_vallocs.upper_bound(a);             // first base strictly greater than a
+    if (it != g_vallocs.begin()) {
+        --it; char *base = it->first; size_t sz = it->second;
+        if (a >= base && a < base + sz) {
+            info->BaseAddress = a; info->AllocationBase = base;
+            info->RegionSize = (SIZE_T)(base + sz - a);
+            info->State = 0x1000; info->Protect = 0x04; info->Type = 0x20000;   // COMMIT / RW / PRIVATE
+            return len;
+        }
+    }
+    return 0;                                       // not a tracked address
+}
+HGLOBAL GlobalAlloc(UINT, SIZE_T size)  { return static_cast<HGLOBAL>(calloc(1, size ? size : 1)); }
+void   *GlobalLock(HGLOBAL h)           { return h; }
+BOOL    GlobalUnlock(HGLOBAL)           { return TRUE; }
+HGLOBAL GlobalFree(HGLOBAL h)           { free(h); return nullptr; }
+
+// ---- Directory enumeration (FindFirstFile* -> glob) ------------------------
+// Kept here (not in windows.h) so <glob.h>'s `glob` symbol doesn't collide with the
+// engine's `glob` variables. Find handles are a separate namespace from kernel
+// objects above — the engine closes them with FindClose, never CloseHandle.
+namespace {
+struct FindState { glob_t g; size_t i; };
+void FindFill(FindState *h, WIN32_FIND_DATAA *d) {
+    const char *p = h->g.gl_pathv[h->i];
+    const char *base = strrchr(p, '/'); base = base ? base + 1 : p;
+    int n = 0; while (base[n] && n < MAX_PATH - 1) { d->cFileName[n] = base[n]; ++n; }
+    d->cFileName[n] = '\0'; d->dwFileAttributes = 0;
+}
+} // namespace
+HANDLE FindFirstFileA(const char *pattern, WIN32_FIND_DATAA *d) {
+    FindState *h = new FindState(); h->i = 0;
+    if (glob(pattern, 0, nullptr, &h->g) != 0 || h->g.gl_pathc == 0) { globfree(&h->g); delete h; return INVALID_HANDLE_VALUE; }
+    FindFill(h, d); return static_cast<HANDLE>(h);
+}
+BOOL FindNextFileA(HANDLE handle, WIN32_FIND_DATAA *d) {
+    FindState *h = static_cast<FindState *>(handle);
+    if (++h->i >= h->g.gl_pathc) return FALSE;
+    FindFill(h, d); return TRUE;
+}
+BOOL FindClose(HANDLE handle) {
+    FindState *h = static_cast<FindState *>(handle);
+    if (h && h != INVALID_HANDLE_VALUE) { globfree(&h->g); delete h; } return TRUE;
+}

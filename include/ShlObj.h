@@ -1,0 +1,38 @@
+// ShlObj.h — minimal portable stand-in. The engine uses only SHGetFolderPathA, to
+// resolve the user's data/documents folder (com_files.cpp). Map the relevant CSIDLs
+// onto $HOME so the game writes under the user's home directory on Linux.
+#ifndef KISAK_SHLOBJ_H
+#define KISAK_SHLOBJ_H
+
+#include "windows.h"
+
+#define CSIDL_PERSONAL      0x0005
+#define CSIDL_LOCAL_APPDATA 0x001c
+#define CSIDL_FLAG_CREATE   0x8000
+
+// avoid pulling <cstdlib>'s random(); musl declares getenv without an exception-spec.
+#ifdef __EMSCRIPTEN__
+extern "C" char *getenv(const char *);
+#else
+extern "C" char *getenv(const char *) noexcept;
+#endif
+
+static inline HRESULT SHGetFolderPathA(HWND, int /*csidl*/, HANDLE, DWORD, char *pszPath) {
+    if (!pszPath) return (HRESULT)-1;
+    const char *home = getenv("HOME");
+#ifdef __EMSCRIPTEN__
+    // Emscripten MEMFS: '/home/web_user' is created by the runtime at init (and is
+    // the default $HOME). NEVER fall back to '/tmp' with this CSIDL path — the engine
+    // appends "\Activision\CoD" and later writes config/screenshots there; if the
+    // base dir doesn't exist a write throws ErrnoError 44 (ENOENT) and can wedge an
+    // Asyncify resume. '/home/web_user' is guaranteed to exist (the boot preRun in
+    // index.html also mkdirTree's the full home tree as belt-and-suspenders).
+    const char *base = (home && *home) ? home : "/home/web_user";
+#else
+    const char *base = home ? home : "/tmp";
+#endif
+    int n = 0; while (base[n] && n < MAX_PATH - 1) { pszPath[n] = base[n]; ++n; }
+    pszPath[n] = '\0';
+    return 0;  // S_OK
+}
+#endif
