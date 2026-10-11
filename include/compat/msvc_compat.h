@@ -125,7 +125,7 @@ static inline int strncpy_s(char *dst, size_t size, const char *src, size_t coun
     dst[n] = 0;
     return 0;
 }
-extern "C" void *_aligned_malloc(size_t size, size_t align); // platform/linux/sys_platform.cpp
+extern "C" void *_aligned_malloc(size_t size, size_t align);
 extern "C" void _aligned_free(void *p);
 
 // MSVC's _-prefixed sized-int CRT conversions -> POSIX/C equivalents. Declared

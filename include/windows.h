@@ -46,9 +46,11 @@ KISAK_DECLARE_HANDLE(HGLRC);
 
 static inline DWORD GetCurrentThreadId()  { return (DWORD)(uintptr_t)pthread_self(); }
 static inline DWORD GetCurrentProcessId() { return (DWORD)getpid(); }
-// Filled by main (linux_main.cpp) from argv; a static initializer reading it earlier sees an empty command line.
-extern char g_kbCommandLine[2048];
-static inline char *GetCommandLineA() { return g_kbCommandLine; }
+// Set by WebWin_SetCommandLine (webwin/process.h); a static initializer reading it earlier sees an empty command line.
+#ifdef __cplusplus
+extern "C"
+#endif
+char *GetCommandLineA();
 static inline BOOL CreateDirectoryA(const char *path, void *) { return mkdir(path, 0777) == 0; }
 typedef pthread_rwlock_t SRWLOCK, *PSRWLOCK;
 #define SRWLOCK_INIT PTHREAD_RWLOCK_INITIALIZER

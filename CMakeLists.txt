@@ -9,6 +9,8 @@ add_library(webwin STATIC
     src/web_fs.cpp
     src/sdl_window.cpp
     src/msvc_rand.cpp
+    src/msvc_crt.cpp
+    src/process.cpp
 )
 set_target_properties(webwin PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
 
