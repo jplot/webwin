@@ -133,11 +133,15 @@ extern "C" void _aligned_free(void *p);
 // collide with the engine's own random() declaration (only scope-renamed in a few
 // files). These libc symbols are otherwise standard.
 #if defined(__EMSCRIPTEN__)  // musl declares these without an exception-spec
+extern "C" int                atoi(const char *);
+extern "C" double             atof(const char *);
 extern "C" long long          atoll(const char *);
 extern "C" long long          strtoll(const char *, char **, int);
 extern "C" unsigned long long strtoull(const char *, char **, int);
 extern "C" int                putenv(char *);
 #else
+extern "C" int                atoi(const char *) noexcept;
+extern "C" double             atof(const char *) noexcept;
 extern "C" long long          atoll(const char *) noexcept;
 extern "C" long long          strtoll(const char *, char **, int) noexcept;
 extern "C" unsigned long long strtoull(const char *, char **, int) noexcept;
