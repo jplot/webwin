@@ -274,6 +274,7 @@ EM_JS(void, kbw_store, (int id, int blockIdx, void *scratch, int n), {
     const g = (globalThis.__kbwB || (globalThis.__kbwB = new Map()));
     let fileMap = g.get(id);
     if (!fileMap) { fileMap = new Map(); g.set(id, fileMap); }
+    fileMap.delete(blockIdx);   // set() keeps a key's place: a refetched oldest block was evicted again
     fileMap.set(blockIdx, HEAPU8.slice(scratch, scratch + n));   // private (non-shared) copy
     if (fileMap.size > 64) fileMap.delete(fileMap.keys().next().value);  // ~16MB/file cap
 });

@@ -52,4 +52,8 @@ if (WEBWIN_WEB_TESTS AND EMSCRIPTEN AND WEBWIN_PTHREADS)
     target_link_libraries(net_threads PRIVATE webwin)
     target_link_options(net_threads PRIVATE -sPROXY_TO_PTHREAD -sEXIT_RUNTIME=1 -sPTHREAD_POOL_SIZE=8
         "--pre-js=${CMAKE_CURRENT_SOURCE_DIR}/tests/web/net_threads.pre.js")
+    add_executable(fs_threads tests/web/fs_threads.cpp)
+    target_link_libraries(fs_threads PRIVATE webwin)
+    target_link_options(fs_threads PRIVATE -sPROXY_TO_PTHREAD -sEXIT_RUNTIME=1 -sPTHREAD_POOL_SIZE=8
+        "--pre-js=${CMAKE_CURRENT_SOURCE_DIR}/tests/web/fs_threads.pre.js")
 endif()
